@@ -41,7 +41,7 @@ skew <- function(x) {
 
 # Import data
 ```{r import_data}
-path <- "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/Data/fish_removal_data.xlsx"
+path <- "./../data/fish_removal_data.xlsx"
 
 df_import <- path %>%
   read_xlsx(sheet = 1, range = "A1:G12028") 

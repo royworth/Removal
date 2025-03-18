@@ -24,7 +24,7 @@ library(tidyr)
 library(bayesplot)
 library(tidybayes)
 library(rstan)
-library(SBC) # install at: devtools::install_github("hyunjimoon/SBC")
+#library(SBC) # install at: devtools::install_github("hyunjimoon/SBC")
 
 options(mc.cores = parallel::detectCores(logical = FALSE))
 options( max.print = 1000 )
