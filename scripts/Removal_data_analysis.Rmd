@@ -1,0 +1,1168 @@
+---
+title: "Removal data analysis"
+author: "Roy Martin"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 5
+    number_sections: true
+    keep_html: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, echo = FALSE, warning=FALSE, message=FALSE}
+library(readxl)
+library(ggpubr)
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library(bayesplot)
+library(tidybayes)
+library(rstan)
+#library(SBC) # install at: devtools::install_github("hyunjimoon/SBC")
+
+options(mc.cores = parallel::detectCores(logical = FALSE))
+options( max.print = 1000 )
+
+# stat: skew 
+skew <- function(x) {
+  xdev <- x - mean(x)
+  n <- length(x)
+  r <- sum(xdev^3) / sum(xdev^2) ^ 1.5
+  return(r * sqrt(n) * (1 - 1/n)^1.5)
+}
+```
+
+# Import data
+```{r import_data}
+path <- "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/Data/fish_removal_data.xlsx"
+
+df_import <- path %>%
+  read_xlsx(sheet = 1, range = "A1:G12028") 
+
+df_removal <- df_import %>%
+  mutate(species = factor(species),
+         length = as.numeric(length)) %>%
+  mutate(site = factor(site)) %>%
+  group_by(site) %>%
+  mutate(site_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(site, section) %>% # sections nested in sites
+  mutate(section_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(species) %>%
+  mutate(species_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(site, species) %>%
+  mutate(species_site_index = cur_group_id()) %>%
+  ungroup() %>%
+  mutate(individual = row_number()) %>%
+  select(site, section, date, year, individual, species, length, pass, site_index, section_index, species_index, species_site_index)
+
+df_removal %>% print()
+#save(df_cleaned, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/ICPMS_methods/ICPMS_7d_Expt/model_files/df_cleaned.rda")
+```
+
+
+# Single species Stan model
+```{stan rem_model_1, eval=FALSE, include=TRUE, output.var='mod1'}
+data {
+  int<lower = 1> nind; // number of individuals captured (across all site)
+  int<lower = 1> nrem; // number of removals
+  int<lower = 1> nsite; // number of sites
+  int<lower = 1> nsection; // number of sections (within sites; 3 x nsites)
+  int<lower = 1> site [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> section [nind]; // indicator for sections within sites
+  real L[nind]; // length covariate
+  array[nind, nrem] int <lower = 0, upper = 1>  y; // removal capture history
+}
+
+parameters {
+  real b0;
+  real b1;
+  real<lower = 0> sigma_s; // scale of site to site variation in p
+  vector[nsite] z_gamma_s; // non-centered site effects
+  real<lower = 0> sigma_ss; // scale of section-to-section (within site) variation in p
+  vector[nsection] z_gamma_ss; // non-centered section effects
+}
+
+transformed parameters {
+  vector [nind] log_lik;
+  real<lower = 0, upper = 1> p[nind];
+  vector [nsite] gamma_s;
+  vector [nsection] gamma_ss;
+  vector<lower = 0, upper = 1>[nrem] pie[nind];
+  simplex[nrem] muc[nind];
+  vector<lower = 0, upper = 1>[nind] pi0;
+  vector<lower = 0, upper = 1>[nind] pcap;
+  
+  // ranefs for p
+  gamma_s = z_gamma_s * sigma_s;
+  gamma_ss = z_gamma_ss * sigma_ss;
+
+  for(i in 1:nind) {
+    p[i] = inv_logit(b0 + b1 * L[i] + gamma_s[site[i]] + gamma_ss[section[i]]); // probability of removal on pass 1
+    pi0[i] = (1 - p[i]) ^ nrem; // prob not captured across all removals
+    pcap[i] = 1 - pi0[i]; // prob captured across all removals
+    
+    for(j in 1:nrem) {
+      pie[i, j] = p[i] * (1 - p[i]) ^ (j - 1); // probability of removal on subsequent passes
+      muc[i, j] = pie[i, j] / pcap[i]; // multinomial probs (pi_ij) for y|ncap
+    }
+    
+    log_lik[i] = multinomial_lpmf(y[i, ] | muc[i, ]);
+  }
+}
+
+model {
+  // priors
+  target += normal_lpdf(b0 | 0, 1.55);
+  target += normal_lpdf(b1 | 0, 1);
+  target += normal_lpdf(sigma_s | 0, 2.5);
+  target += normal_lpdf(z_gamma_s | 0, 1);
+  target += normal_lpdf(sigma_ss | 0, 2.5);
+  target += normal_lpdf(z_gamma_ss | 0, 1);
+  
+  // sum log-likelihood
+  target += sum(log_lik);
+}
+
+generated quantities {
+  int <lower = 0> N_i[nind];
+  int <lower = 0> N;
+  
+  for(i in 1:nind){
+    N_i[i] = 1 + neg_binomial_rng(1 * (1 - pcap[i]), pcap[i]);
+   }
+  
+  N = sum(N_i);
+}
+```
+
+### Make a data list
+For single species
+```{r data_list}
+df_spp <- df_removal %>%
+  filter(species == "LECY",
+         year == 2013) %>%
+  mutate(length = ifelse(is.na(length), round(mean(na.omit(df_removal$length)), 0), length)) %>% # remove obs with missing length data for now
+  group_by(site) %>% # if some spp missing from some sites: need to re-index sites and sections
+  mutate(site_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(site, section) %>% # if some spp missing
+  mutate(section_index = cur_group_id()) %>%
+  ungroup()
+
+ch <- df_spp %>% mutate(cap = 1) %>% select(individual, pass, cap) %>% spread(pass, cap, fill = 0) # capture history format
+
+data1 <- list(y = ch[, -1],
+              L = as.vector(scale(df_spp$length, center = TRUE, scale = sd(df_spp$length) * 2)),
+              nind = dim(ch)[[1]],
+              nsite = max(df_spp$site_index),
+              nsection = max(df_spp$section_index),
+              site = df_spp$site_index,
+              section = df_spp$section_index,
+              nrem = dim(ch[, -1])[[2]]
+              )
+```
+
+### Fit 1
+Fit the model via $rstan$ interface to $Stan$
+```{r fit_mod1, eval=FALSE, include=TRUE}
+fit1 <- sampling(
+  object = mod1,
+  data = data1,
+  chains = 4,
+  iter = 2000,
+  cores = 4,
+  thin = 1,
+  seed = 24816#,
+  #control = list(adapt_delta = 0.95, max_treedepth = 14)
+  )
+```
+
+### Parameters summary
+Tabular summary of parameters in the linear predictors.
+```{r print_mod1, echo=TRUE}
+print(fit1, pars = c("b0",  "b1", "sigma_s", "sigma_ss", "N", "lp__"), digits_summary = 2)
+```
+
+Extract the draws
+```{r extract_mod1, echo=TRUE}
+draws1 <- extract(fit1)
+```
+
+
+Plot the estimated length effect on p
+```{r p_vs_legnth_plots_mod1, fig.align="center", fig.asp=0.5, fig.width=8}
+# Plot p vs length
+
+L_grid <- seq(-1, 1, 0.1)
+
+logit_p <- matrix(NA, length(draws1$b0), length(L_grid))
+for(i in 1:dim(logit_p)[[2]]){
+  logit_p[, i] <- draws1$b0 + L_grid[i] * draws1$b1
+}
+
+L_grid_scaled <- mean(df_spp$length) + (L_grid * sd(df_spp$length) * 2) # rescale lengths
+
+par(mfrow = c(1, 2))
+plot(apply(logit_p, 2, mean) ~ L_grid_scaled, 
+     typ = 'l', 
+     ylim = c(-2, 2),
+     xlab = "Length (mm)",
+     ylab = expression(logit(hat(p))))
+lines(apply(logit_p, 2, function(x) quantile(x, probs = 0.025)) ~ L_grid_scaled, typ = 'l')
+lines(apply(logit_p, 2, function(x) quantile(x, probs = 0.975)) ~ L_grid_scaled, typ = 'l')
+
+plot(plogis(apply(logit_p, 2, mean)) ~ L_grid_scaled, 
+     typ = 'l', 
+     ylim = c(0, 1),
+     xlab = "Length (mm)",
+     ylab = expression(hat(p)))
+lines(plogis(apply(logit_p, 2, function(x) quantile(x, probs = 0.025))) ~ L_grid_scaled, typ = 'l')
+lines(plogis(apply(logit_p, 2, function(x) quantile(x, probs = 0.975))) ~ L_grid_scaled, typ = 'l')
+```
+
+
+Plot and tables summarizing N and p by site
+```{r p_plots_mod1, fig.align="center", fig.asp=1, fig.width=8}
+# Plot p by site
+par(mfrow = c(4, 3))
+for(s in 1:max(data1$site)){
+  hist(plogis(draws1$b0 + draws1$gamma_s[, s]), # averaging over length
+       freq = F,
+       nclass = 40, 
+       xlim = c(0, 1),
+       main = paste0("Site ", s, ": ", unique(df_spp[which(df_spp$site_index == s),]$site)),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  abline(v = plogis(mean(draws1$b0)), col = 'green', lwd = 3)
+}
+```
+
+
+```{r p_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise p by site
+p_table <- matrix(NA, nrow = max(data1$site), ncol = 4)
+
+for(s in 1:max(data1$site)){
+  p_table[s, 1] <- round(mean(plogis(draws1$b0 + draws1$gamma_s[, s])), 2) # means
+  p_table[s, 2:4] <- round(quantile(plogis(draws1$b0 + draws1$gamma_s[, s]), probs = c(0.025, 0.5, 0.975)), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data1$site), 1),
+         site_name = df_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data1$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+p_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by site")
+```
+
+
+```{r N_plots_mod1, fig.align="center", fig.asp=1, fig.width=8}
+# Plot N by site
+par(mfrow = c(4, 3))
+
+for(s in 1:max(data1$site)){
+  hist(rowSums(draws1$N_i[, data1$site == s]), 
+       nclass = max(rowSums(draws1$N_i[, data1$site == s]))/2, 
+       freq = F,
+       xlim = c(sum(data1$site == s) - 1, round(sum(data1$site == s) / plogis(mean(draws1$b0 + draws1$gamma_s[, s])), 0) * 1.25),
+       main = paste0("Site ", s, ": ", unique(df_spp[which(df_spp$site_index == s),]$site)),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = sum(data1$site == s), col = 'red', lwd = 3)
+}
+```
+
+
+```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise N by site
+N_table <- matrix(NA, nrow = max(data1$site), ncol = 4)
+
+for(s in 1:(max(data1$site))){
+  N_table[s, 1] <- round(mean(rowSums(draws1$N_i[, data1$site == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws1$N_i[, data1$site == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data1$site), 1),
+         site_name = df_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data1$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+N_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+
+N_table %>% ggplot(aes(x = X3, y = median)) + geom_point() + geom_abline()
+```
+ 
+
+# Multiple species Stan models
+
+## Multilevel with fixed Length effect
+```{stan rem_model_2, eval=FALSE, include=TRUE, output.var='mod2'}
+data {
+  int<lower = 1> nind; // number of individuals captured (across all site)
+  int<lower = 1> nspecies; // number of species captured (across all site)
+  int<lower = 1> nsite; // number of sites
+  int<lower = 1> nsection; // number of sections (within sites; 3 x nsites)
+  int<lower = 1> nspecies_section; // nspecies x nsection x nsite
+  int<lower = 1> nrem; // number of removals
+  int<lower = 1> site [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> species [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> section [nind]; // indicator for sections within sites
+  int<lower = 1> species_section [nind]; // indicator for sections within sites
+  real L[nind]; // length covariate
+  array[nind, nrem] int <lower = 0, upper = 1>  y; // removal capture history
+}
+
+parameters {
+  real b0;
+  real b1;
+  real<lower = 0> sigma_sp; // scale of site to site variation in p
+  vector[nspecies] z_gamma_sp; // non-centered species effects
+  real<lower = 0> sigma_s; // scale of site to site variation in p
+  vector[nsite] z_gamma_s; // non-centered site effects
+  real<lower = 0> sigma_ss; // scale of section-to-section (within site) variation in p
+  vector[nsection] z_gamma_ss; // non-centered section effects
+  real<lower = 0> sigma_sps; // scale of species-to-species (within sections within sites) variation in p
+  vector[nspecies_section] z_gamma_sps; // non-centered species-section effects
+}
+
+transformed parameters {
+  vector [nind] log_lik;
+  real<lower = 0, upper = 1> p[nind];
+  vector [nspecies] gamma_sp;
+  vector [nsite] gamma_s;
+  vector [nsection] gamma_ss;
+  vector [nspecies_section] gamma_sps;
+  vector<lower = 0, upper = 1>[nrem] pie[nind];
+  simplex[nrem] muc[nind];
+  vector<lower = 0, upper = 1>[nind] pi0;
+  vector<lower = 0, upper = 1>[nind] pcap;
+  
+  // ranefs for p
+  
+  gamma_sp = z_gamma_sp * sigma_sp;
+  gamma_s = z_gamma_s * sigma_s;
+  gamma_ss = z_gamma_ss * sigma_ss;
+  gamma_sps = z_gamma_sps * sigma_sps;
+
+  for(i in 1:nind) {
+    p[i] = inv_logit(b0 + b1 * L[i] + gamma_sp[species[i]] + gamma_s[site[i]] + gamma_ss[section[i]] + gamma_sps[species_section[i]]); // probability of removal on pass 1
+    pi0[i] = (1 - p[i]) ^ nrem; // prob not captured across all removals
+    pcap[i] = 1 - pi0[i]; // prob captured across all removals
+    
+    for(j in 1:nrem) {
+      pie[i, j] = p[i] * (1 - p[i]) ^ (j - 1); // probability of removal on subsequent passes
+      muc[i, j] = pie[i, j] / pcap[i]; // multinomial probs (pi_ij) for y|ncap
+    }
+    
+    log_lik[i] = multinomial_lpmf(y[i, ] | muc[i, ]);
+  }
+}
+
+model {
+  // priors
+  target += normal_lpdf(b0 | 0, 1.55);
+  target += normal_lpdf(b1 | 0, 1);
+  target += normal_lpdf(sigma_sp | 0, 2.5);
+  target += normal_lpdf(z_gamma_sp | 0, 1);
+  target += normal_lpdf(sigma_s | 0, 2.5);
+  target += normal_lpdf(z_gamma_s | 0, 1);
+  target += normal_lpdf(sigma_ss | 0, 2.5);
+  target += normal_lpdf(z_gamma_ss | 0, 1);
+  target += normal_lpdf(sigma_sps | 0, 2.5);
+  target += normal_lpdf(z_gamma_sps | 0, 1);
+  
+  // sum log-likelihood
+  target += sum(log_lik);
+}
+
+generated quantities {
+  int <lower = 0> N_i[nind];
+  int <lower = 0> N;
+  
+  for(i in 1:nind){
+    N_i[i] = 1 + neg_binomial_rng(1 * (1 - pcap[i]), pcap[i]);
+   }
+  
+  N = sum(N_i);
+}
+```
+
+
+### Make a data list
+For all species
+```{r data_list}
+df_all_spp <- df_removal %>%
+  filter(year == 2013) %>% # 2013 only
+  mutate(length = ifelse(is.na(length), round(mean(na.omit(df_removal$length)), 0), length)) %>%
+  group_by(site) %>% # if some spp missing from some sites: need to re-index sites and sections
+  mutate(site_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(species) %>% # if some spp missing
+  mutate(species_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(site, section) %>% # if some spp missing
+  mutate(section_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(species, site, section) %>% # if some spp missing
+  mutate(species_section_index = cur_group_id()) %>%
+  ungroup()
+
+ch <- df_all_spp %>% mutate(cap = 1) %>% select(individual, pass, cap) %>% spread(pass, cap, fill = 0) # capture history format
+
+data2 <- list(y = ch[, -1],
+              L = as.vector(scale(df_all_spp$length, center = TRUE, scale = sd(df_all_spp$length) * 2)),
+              nind = dim(ch)[[1]],
+              nspecies = max(df_all_spp$species_index),
+              nsite = max(df_all_spp$site_index),
+              nsection = max(df_all_spp$section_index),
+              nspecies_section = max(df_all_spp$species_section_index),
+              site = df_all_spp$site_index,
+              species = df_all_spp$species_index,
+              section = df_all_spp$section_index,
+              species_section = df_all_spp$species_section_index,
+              nrem = dim(ch[, -1])[[2]]
+              )
+```
+
+### Fit 2
+Fit the model via $rstan$ interface to $Stan$
+```{r fit_mod1, eval=FALSE, include=TRUE}
+fit2 <- sampling(
+  object = mod2,
+  data = data2,
+  init = 0,
+  chains = 4,
+  iter = 2000,
+  cores = 4,
+  thin = 1,
+  seed = 150#,
+  #control = list(adapt_delta = 0.95, max_treedepth = 14)
+  )
+
+#save(fit2, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit2.rda")
+```
+
+### Parameters summary
+Tabular summary of parameters in the linear predictors.
+```{r load_mod2, eval=TRUE, include=FALSE}
+load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit2.rda")
+```
+
+```{r print_mod2}
+print(fit2, pars = c("b0",  "b1", "sigma_sp", "sigma_s", "sigma_ss", "sigma_sps", "N", "lp__"), digits_summary = 2)
+```
+
+Extract the draws
+```{r extract_mod2, eval=FALSE, include=TRUE}
+draws2 <- extract(fit2)
+
+save(draws2, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws2.rda")
+```
+
+```{r load_draws, eval=FALSE, include=FALSE}
+load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws2.rda")
+```
+
+
+
+### Plots and tables
+
+```{r pick_a_species}
+# pick a species by index
+k <- 3
+
+unique(df_all_spp[which(df_all_spp$species_index == k),]$species)
+df_all_spp %>% filter(species_index == k) %>% pull(site_index) %>% unique() %>% sort()
+df_all_spp %>% filter(species_index == k) %>% pull(species_site_index) %>% unique() %>% sort()
+df_all_spp %>% filter(species_index == k) %>% group_by(site_index) %>% summarise(X3 = n())
+
+S <- df_all_spp %>% filter(species_index == k) %>% pull(site_index) %>% unique() %>% sort()
+KS <- df_all_spp %>% filter(species_index == k) %>% pull(species_site_index) %>% unique() %>% sort()
+X3 <- df_all_spp %>% filter(species_index == k) %>% group_by(site_index) %>% summarise(X3 = n()) %>% pull(X3)
+#i <- seq(1, length(s)) # index species x site index to site
+```
+
+#### Plot p 
+##### Site
+```{r p_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 4))
+for(s in sort(unique(df_all_spp$site_index))){
+  if(s %in% S){
+    hist(plogis(draws2$b0 + draws2$gamma_s[ , s]), 
+       freq = F,
+       nclass = 30, 
+       xlim = c(0, 1),
+       main = paste0("Site ", s),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  abline(v = plogis(mean(draws2$b0)), col = 'green', lwd = 3)
+    } else {
+  
+    plot(0, 
+         typ = 'n',
+         main = paste0("Site ", s),
+         ylab = "Density",
+         xlab = expression(hat(p)))
+}}
+```
+
+##### species
+```{r p_plots_spp_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 4))
+for(s in sort(unique(df_all_spp$species_index))){
+  if(s %in% sort(unique(df_all_spp$species_index))){
+    hist(plogis(draws2$b0 + draws2$gamma_sp[ , s]), 
+       freq = F,
+       nclass = 30, 
+       xlim = c(0, 1),
+       main = paste0("Species ", s),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  abline(v = plogis(mean(draws2$b0)), col = 'green', lwd = 3)
+    } else {
+  
+    plot(0, 
+         typ = 'n',
+         main = paste0("Species ", s),
+         ylab = "Density",
+         xlab = expression(hat(p)))
+}}
+```
+
+#### Table summary of p 
+##### Site
+```{r p_table_mod2, fig.align="center", fig.asp=1.1, fig.width=6}
+p_table <- matrix(NA, nrow = max(data2$site), ncol = 4)
+
+for(s in S){
+  p_table[s, 1] <- round(plogis(mean(draws2$b0 + draws2$gamma_s[, s])), 2) # means
+  p_table[s, 2:4] <- round(plogis(quantile(draws2$b0 + draws2$gamma_s[, s], probs = c(0.025, 0.5, 0.975))), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data2$site), 1),
+         site_name = df_all_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data2$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+p_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by site")
+```
+
+##### Species
+```{r p_table_mod2, fig.align="center", fig.asp=1.5, fig.width=8}
+p_table <- matrix(NA, nrow = data2$nspecies, ncol = 4)
+
+for(s in sort(unique(data2$species))){
+  p_table[s, 1] <- round(plogis(mean(draws2$b0 + draws2$gamma_sp[, s])), 2) # means
+  p_table[s, 2:4] <- round(plogis(quantile(draws2$b0 + draws2$gamma_sp[, s], probs = c(0.025, 0.5, 0.975))), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(species_index = seq(1, data2$nspecies, 1),
+         species_name = df_all_spp %>% select(species_index, species) %>% unique() %>% arrange(species_index) %>% pull(species),
+         X3 = as.vector(summary(factor(data2$species)))) %>% # number removed in passes 1-3
+  select(species_index, species_name, X3, mean, median, L95, U95)
+
+p_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by species")
+```
+
+#### Plot N 
+##### Site
+```{r N_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 3))
+
+for(s in 1:max(data2$site)){
+  hist(rowSums(draws2$N_i[, data2$site == s]), 
+       nclass = max(rowSums(draws2$N_i[, data2$site == s]))/2, 
+       freq = F,
+       xlim = c(sum(data2$site == s), round(sum(data2$site == s) / plogis(mean(draws2$b0 + draws2$gamma_s[, s])), 0) * 1.5),
+       main = paste0("Site ", s, ": ", unique(df_all_spp[which(df_all_spp$site_index == s),]$site)),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = sum(data2$site == s), col = 'red', lwd = 3)
+}
+```
+
+##### Species
+```{r N_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 3))
+
+for(s in sort(unique(data2$species))){
+  hist(rowSums(draws2$N_i[, data2$species == s]), 
+       nclass = max(rowSums(draws2$N_i[, data2$species == s]))/2, 
+       freq = F,
+       xlim = c(sum(data2$species == s), round(sum(data2$species == s) / plogis(mean(draws2$b0 + draws2$gamma_sp[, s])), 0) * 1.5),
+       main = paste0("Species ", s, ": ", unique(df_all_spp[which(df_all_spp$species_index == s),]$species)),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = sum(data2$species == s), col = 'red', lwd = 3)
+}
+```
+
+
+#### Table summary of N
+##### Site
+```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise N by site
+N_table <- matrix(NA, nrow = max(data2$site), ncol = 4)
+
+for(s in 1:(max(data2$site))){
+  N_table[s, 1] <- round(mean(rowSums(draws2$N_i[, data2$site == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws2$N_i[, data2$site == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data2$site), 1),
+         site_name = df_all_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data2$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+N_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+
+#N_table %>% ggplot(aes(x = X3, y = median)) + geom_point() + geom_abline()
+```
+
+##### Species
+```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise N by site
+N_table <- matrix(NA, nrow = data2$nspecies, ncol = 4)
+
+for(s in sort(unique(data2$species))){
+  N_table[s, 1] <- round(mean(rowSums(draws2$N_i[, data2$species == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws2$N_i[, data2$species == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(species_index = seq(1, max(data2$species), 1),
+         species_name = df_all_spp %>% select(species_index, species) %>% unique() %>% arrange(species_index) %>% pull(species),
+         X3 = as.vector(summary(factor(data2$species)))) %>% # number removed in passes 1-3
+  select(species_index, species_name, X3, mean, median, L95, U95)
+
+N_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+
+#N_table %>% ggplot(aes(x = X3, y = median)) + geom_point() + geom_abline()
+```
+
+#### Length frequency
+Create table of posterior predicted median N vs. lengths.
+
+```{r table_est_lw}
+df_lw <- tibble(length = df_all_spp$length, 
+                count = as.integer(round(apply(draws2$N_i, 2, median), 0)),
+                species = df_all_spp$species,
+                site = df_all_spp$site,
+                section = df_all_spp$section
+                )
+df_lw <- df_lw %>% uncount(count) %>% mutate(count = 1)
+```
+
+Filter on e.g., species, site and plot
+```{r lf_plots_mod2, fig.align="center", fig.asp=1, fig.width=6}
+df_lw_plot <- df_lw %>%
+  filter(species == "PINO",
+         site == "Grassy Fork")
+df_obs_plot <- df_all_spp %>%
+  filter(species == "PINO",
+         site == "Grassy Fork")
+
+#hist(df_obs_plot$length, freq = F, nclass = 200)
+#hist(df_lw2$length, freq = F, nclass = 200, add = TRUE, col = 'red')
+
+
+plot(density(df_lw_plot$length), lwd =2, main = "", xlab = "Length (mm)", col = 'red')
+lines(density(df_obs_plot$length), lwd =3, lty = 2, col = 'grey')
+```
+
+
+## Multilevel with varying Length effect
+```{stan rem_model_3, eval=FALSE, include=TRUE, output.var='mod3'}
+data {
+  int<lower = 1> nind; // number of individuals captured (across all site)
+  int<lower = 1> nspecies; // number of species captured (across all site)
+  int<lower = 1> nsite; // number of sites
+  int<lower = 1> nsection; // number of sections (within sites; 3 x nsites)
+  int<lower = 1> nspecies_section; // nspecies x nsection x nsite
+  int<lower = 1> nrem; // number of removals
+  int<lower = 1> site [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> species [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> section [nind]; // indicator for sections within sites
+  int<lower = 1> species_section [nind]; // indicator for sections within sites
+  real L[nind]; // length covariate
+  array[nind, nrem] int <lower = 0, upper = 1>  y; // removal capture history
+}
+
+parameters {
+  real b0;
+  real b1;
+  vector<lower = 0> [2] sigma_sp; // scale of site to site variation in p
+  matrix[2, nspecies] z_gamma_sp; // non-centered species effects
+  real<lower = 0> sigma_s; // scale of site to site variation in p
+  vector[nsite] z_gamma_s; // non-centered site effects
+  real<lower = 0> sigma_ss; // scale of section-to-section (within site) variation in p
+  vector[nsection] z_gamma_ss; // non-centered section effects
+  real<lower = 0> sigma_sps; // scale of species-to-species (within sections within sites) variation in p
+  vector[nspecies_section] z_gamma_sps; // non-centered species-section effects
+  cholesky_factor_corr[2] L_Omega_sp;
+}
+
+transformed parameters {
+  vector [nind] log_lik;
+  real<lower = 0, upper = 1> p[nind];
+  matrix[2, nspecies] gamma_sp;
+  vector [nsite] gamma_s;
+  vector [nsection] gamma_ss;
+  vector [nspecies_section] gamma_sps;
+  vector<lower = 0, upper = 1> [nrem] pie[nind];
+  simplex[nrem] muc[nind];
+  vector<lower = 0, upper = 1> [nind] pi0;
+  vector<lower = 0, upper = 1> [nind] pcap;
+  
+  // ranefs for p
+  gamma_sp = diag_pre_multiply(sigma_sp, L_Omega_sp) * z_gamma_sp;
+  gamma_s = z_gamma_s * sigma_s;
+  gamma_ss = z_gamma_ss * sigma_ss;
+  gamma_sps = z_gamma_sps * sigma_sps;
+
+  for(i in 1:nind) {
+    p[i] = inv_logit(b0 + (b1 + gamma_sp[2, species[i]]) * L[i] + gamma_sp[1, species[i]] + gamma_s[site[i]] + gamma_ss[section[i]] + gamma_sps[species_section[i]]); // pr, captured (on any give pass)
+    pi0[i] = (1 - p[i]) ^ nrem; // prob not captured across all removals
+    pcap[i] = 1 - pi0[i]; // prob captured across all removals
+    
+    for(j in 1:nrem) {
+      pie[i, j] = p[i] * (1 - p[i]) ^ (j - 1); // probability of removal on subsequent passes
+      muc[i, j] = pie[i, j] / pcap[i]; // multinomial probs (pi_ij) for y|ncap
+    }
+    
+    log_lik[i] = multinomial_lpmf(y[i, ] | muc[i, ]);
+  }
+}
+
+model {
+  // priors
+  target += normal_lpdf(b0 | 0, 1.55);
+  target += normal_lpdf(b1 | 0, 1);
+  target += normal_lpdf(sigma_sp | 0, 2.5);
+  target += normal_lpdf(to_vector(z_gamma_sp) | 0, 1);
+  target += lkj_corr_cholesky_lpdf(L_Omega_sp | 1);
+  target += normal_lpdf(sigma_s | 0, 2.5);
+  target += normal_lpdf(z_gamma_s | 0, 1);
+  target += normal_lpdf(sigma_ss | 0, 2.5);
+  target += normal_lpdf(z_gamma_ss | 0, 1);
+  target += normal_lpdf(sigma_sps | 0, 2.5);
+  target += normal_lpdf(z_gamma_sps | 0, 1);
+  
+  // sum log-likelihood
+  target += sum(log_lik);
+}
+
+generated quantities {
+  matrix[2, 2] Omega_sp; // correlation matrix
+  int nc = 1; // assign integer value 1 for each individual in ncap
+  int <lower = 0> N_i0[nind]; // number not captured (at each individual captured)
+  int <lower = 0> N_i[nind]; // count (1) of individual captured + Ni0
+  int <lower = 0> N; // sum 1 + Ni0 across all known captured (all sites, etc)
+  
+  Omega_sp = multiply_lower_tri_self_transpose(L_Omega_sp);
+  
+  N_i0 = neg_binomial_rng(pi0, pcap); // alpha = (n_success = 1) * (1 - pcap) = 1 * pi0; beta = pcap
+  
+  for(i in 1:nind){
+   N_i[i] = N_i0[i] + nc;
+   }
+  
+  N = sum(N_i);
+}
+```
+
+
+### Make a data list
+For all species
+```{r data_list}
+df_all_spp <- df_removal %>%
+  filter(year == 2013) %>% # 2013 only
+  mutate(length = ifelse(is.na(length), round(mean(na.omit(df_removal$length)), 0), length)) %>%
+  group_by(site) %>% # if some spp missing from some sites: need to re-index sites and sections
+  mutate(site_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(species) %>% # if some spp missing
+  mutate(species_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(site, section) %>% # if some spp missing
+  mutate(section_index = cur_group_id()) %>%
+  ungroup() %>%
+  group_by(species, site, section) %>% # if some spp missing
+  mutate(species_section_index = cur_group_id()) %>%
+  ungroup()
+
+ch <- df_all_spp %>% mutate(cap = 1) %>% select(individual, pass, cap) %>% spread(pass, cap, fill = 0) # capture history format
+
+data3 <- list(y = ch[, -1],
+              L = as.vector(scale(df_all_spp$length, center = TRUE, scale = sd(df_all_spp$length) * 2)),
+              nind = dim(ch)[[1]],
+              nspecies = max(df_all_spp$species_index),
+              nsite = max(df_all_spp$site_index),
+              nsection = max(df_all_spp$section_index),
+              nspecies_section = max(df_all_spp$species_section_index),
+              site = df_all_spp$site_index,
+              species = df_all_spp$species_index,
+              section = df_all_spp$section_index,
+              species_section = df_all_spp$species_section_index,
+              nrem = dim(ch[, -1])[[2]]
+              )
+```
+
+### Fit 3
+Fit the model via $rstan$ interface to $Stan$
+```{r fit_mod1, eval=FALSE, include=TRUE}
+fit3 <- sampling(
+  object = mod3,
+  data = data3,
+  init = 0,
+  chains = 4,
+  iter = 2000,
+  cores = 4,
+  thin = 1,
+  seed = 100#,
+  #control = list(adapt_delta = 0.95, max_treedepth = 14)
+  )
+
+#save(fit3, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit2.rda")
+```
+
+### Parameters summary
+Tabular summary of parameters in the linear predictors.
+```{r load_mod2, eval=TRUE, include=FALSE}
+load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit3.rda")
+```
+
+```{r print_mod2}
+print(fit3, pars = c("b0",  "b1", "sigma_sp", "sigma_s", "sigma_ss", "sigma_sps", "Omega_sp", "N", "lp__"), digits_summary = 2)
+```
+
+Extract the draws
+```{r extract_mod2, eval=FALSE, include=TRUE}
+draws3 <- extract(fit3)
+
+save(draws3, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
+```
+
+```{r load_draws, eval=FALSE, include=FALSE}
+load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
+```
+
+
+
+### Plots and tables
+
+```{r pick_a_species}
+# pick a species by index
+k <- 3
+
+unique(df_all_spp[which(df_all_spp$species_index == k),]$species)
+df_all_spp %>% filter(species_index == k) %>% pull(site_index) %>% unique() %>% sort()
+df_all_spp %>% filter(species_index == k) %>% pull(species_site_index) %>% unique() %>% sort()
+df_all_spp %>% filter(species_index == k) %>% group_by(site_index) %>% summarise(X3 = n())
+
+S <- df_all_spp %>% filter(species_index == k) %>% pull(site_index) %>% unique() %>% sort()
+KS <- df_all_spp %>% filter(species_index == k) %>% pull(species_site_index) %>% unique() %>% sort()
+X3 <- df_all_spp %>% filter(species_index == k) %>% group_by(site_index) %>% summarise(X3 = n()) %>% pull(X3)
+#i <- seq(1, length(s)) # index species x site index to site
+```
+
+#### Plot p 
+##### Site
+```{r p_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 4))
+for(s in sort(unique(df_all_spp$site_index))){
+  if(s %in% S){
+    hist(plogis(draws3$b0 + draws3$gamma_s[ , s]), 
+       freq = F,
+       nclass = 30, 
+       xlim = c(0, 1),
+       main = paste0("Site ", s),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  abline(v = plogis(mean(draws3$b0)), col = 'green', lwd = 3)
+    } else {
+  
+    plot(0, 
+         typ = 'n',
+         main = paste0("Site ", s),
+         ylab = "Density",
+         xlab = expression(hat(p)))
+}}
+```
+
+##### species
+```{r p_plots_spp_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 4))
+for(s in sort(unique(df_all_spp$species_index))){
+  if(s %in% sort(unique(df_all_spp$species_index))){
+    hist(plogis(draws3$b0 + draws3$gamma_sp[ , 1, s]), 
+       freq = F,
+       nclass = 30, 
+       xlim = c(0, 1),
+       main = paste0("Species ", s),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  abline(v = plogis(mean(draws3$b0)), col = 'green', lwd = 3)
+    } else {
+  
+    plot(0, 
+         typ = 'n',
+         main = paste0("Species ", s),
+         ylab = "Density",
+         xlab = expression(hat(p)))
+}}
+```
+
+Plot the estimated length effect on p
+```{r p_vs_legnth_plots_mod3, fig.align="center", fig.asp=0.5, fig.width=8}
+# Plot p vs length
+
+L_grid <- seq(-1, 1.5, 0.1)
+
+logit_p <- matrix(NA, length(draws3$b0), length(L_grid))
+for(i in 1:dim(logit_p)[[2]]){
+  logit_p[, i] <- draws3$b0 + L_grid[i] * draws3$b1
+}
+
+L_grid_scaled <- mean(df_all_spp$length) + (L_grid * sd(df_all_spp$length) * 2) # rescale lengths
+
+draws_p <- sample(1:dim(logit_p)[[1]], 20) # 20 random draws of b0 + b1
+par(mfrow = c(1, 2))
+plot(apply(logit_p, 2, mean) ~ L_grid_scaled, 
+     typ = 'l', 
+     ylim = c(-2, 2),
+     xlab = "Length (mm)",
+     ylab = expression(logit(hat(p))))
+lines(apply(logit_p, 2, function(x) quantile(x, probs = 0.025)) ~ L_grid_scaled, typ = 'l')
+lines(apply(logit_p, 2, function(x) quantile(x, probs = 0.975)) ~ L_grid_scaled, typ = 'l')
+
+plot(plogis(apply(logit_p, 2, mean)) ~ L_grid_scaled, 
+     typ = 'l', 
+     ylim = c(0, 1),
+     xlab = "Length (mm)",
+     ylab = expression(hat(p)))
+lines(plogis(apply(logit_p, 2, function(x) quantile(x, probs = 0.025))) ~ L_grid_scaled, typ = 'l')
+lines(plogis(apply(logit_p, 2, function(x) quantile(x, probs = 0.975))) ~ L_grid_scaled, typ = 'l')
+```
+
+
+#### Table summary of p 
+##### Site
+```{r p_table_mod2, fig.align="center", fig.asp=1.1, fig.width=6}
+p_table <- matrix(NA, nrow = max(data3$site), ncol = 4)
+
+for(s in S){
+  p_table[s, 1] <- round(plogis(mean(draws3$b0 + draws3$gamma_s[, s])), 2) # means
+  p_table[s, 2:4] <- round(plogis(quantile(draws3$b0 + draws3$gamma_s[, s], probs = c(0.025, 0.5, 0.975))), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data3$site), 1),
+         site_name = df_all_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data3$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+p_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by site")
+```
+
+##### Species
+```{r p_table_mod2, fig.align="center", fig.asp=1.5, fig.width=8}
+p_table <- matrix(NA, nrow = data3$nspecies, ncol = 4)
+
+for(s in sort(unique(data3$species))){
+  p_table[s, 1] <- round(plogis(mean(draws3$b0 + draws3$gamma_sp[, 1, s])), 2) # means
+  p_table[s, 2:4] <- round(plogis(quantile(draws3$b0 + draws3$gamma_sp[, 1, s], probs = c(0.025, 0.5, 0.975))), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(species_index = seq(1, data3$nspecies, 1),
+         species_name = df_all_spp %>% select(species_index, species) %>% unique() %>% arrange(species_index) %>% pull(species),
+         X3 = as.vector(summary(factor(data3$species)))) %>% # number removed in passes 1-3
+  select(species_index, species_name, X3, mean, median, L95, U95)
+
+p_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by species")
+```
+
+#### Plot N 
+##### Site
+```{r N_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 3))
+
+for(s in 1:max(data3$site)){
+  hist(rowSums(draws3$N_i[, data3$site == s]), 
+       nclass = as.integer(round(quantile(rowSums(draws3$N_i[, data3$site == s]), probs = 0.975) / 2, 0)), 
+       freq = F,
+       xlim = c(sum(data3$site == s), quantile(rowSums(draws3$N_i[, data3$site == s]), probs = 0.995)),
+       main = paste0("Site ", s, ": ", unique(df_all_spp[which(df_all_spp$site_index == s),]$site)),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = sum(data3$site == s), col = 'red', lwd = 3)
+}
+```
+
+##### Species
+```{r N_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
+par(mfrow = c(4, 3))
+
+for(s in sort(unique(data2$species))){
+  hist(rowSums(draws2$N_i[, data2$species == s]), 
+       nclass = max(rowSums(draws2$N_i[, data2$species == s]))/2, 
+       freq = F,
+       xlim = c(sum(data2$species == s), round(sum(data2$species == s) / plogis(mean(draws2$b0 + draws2$gamma_sp[, s])), 0) * 1.5),
+       main = paste0("Species ", s, ": ", unique(df_all_spp[which(df_all_spp$species_index == s),]$species)),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = sum(data2$species == s), col = 'red', lwd = 3)
+}
+```
+
+
+#### Table summary of N
+##### Site
+```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise N by site
+N_table <- matrix(NA, nrow = max(data3$site), ncol = 4)
+
+for(s in 1:(max(data3$site))){
+  N_table[s, 1] <- round(mean(rowSums(draws3$N_i[, data3$site == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws3$N_i[, data3$site == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site_index = seq(1, max(data3$site), 1),
+         site_name = df_all_spp %>% select(site_index, site) %>% unique() %>% arrange(site_index) %>% pull(site),
+         X3 = as.vector(summary(factor(data3$site)))) %>% # number removed in passes 1-3
+  select(site_index, site_name, X3, mean, median, L95, U95)
+
+N_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+
+#N_table %>% ggplot(aes(x = X3, y = median)) + geom_point() + geom_abline()
+```
+
+##### Species
+```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
+# Summarise N by site
+N_table <- matrix(NA, nrow = data2$nspecies, ncol = 4)
+
+for(s in sort(unique(data2$species))){
+  N_table[s, 1] <- round(mean(rowSums(draws2$N_i[, data2$species == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws2$N_i[, data2$species == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(species_index = seq(1, max(data2$species), 1),
+         species_name = df_all_spp %>% select(species_index, species) %>% unique() %>% arrange(species_index) %>% pull(species),
+         X3 = as.vector(summary(factor(data2$species)))) %>% # number removed in passes 1-3
+  select(species_index, species_name, X3, mean, median, L95, U95)
+
+N_table %>%
+  arrange(median) %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+
+#N_table %>% ggplot(aes(x = X3, y = median)) + geom_point() + geom_abline()
+```
+
+#### Length frequency
+Create table of posterior predicted median N vs. lengths.
+
+```{r table_est_lw}
+df_lw <- tibble(length = df_all_spp$length, 
+                count = as.integer(round(apply(draws3$N_i, 2, median), 0)),
+                species = df_all_spp$species,
+                site = df_all_spp$site,
+                section = df_all_spp$section
+                )
+df_lw <- df_lw %>% uncount(count) %>% mutate(count = 1)
+```
+
+Filter on e.g., species, site and plot
+```{r lf_plots_mod2, fig.align="center", fig.asp=1, fig.width=6}
+#df_lw_plot <- df_lw %>%
+#  filter(species == "CAAN",
+#         site == "Bear Run")
+#df_obs_plot <- df_all_spp %>%
+#  filter(species == "CAAN",
+#         site == "Bear Run")
+
+df_lw_plot <- df_lw %>%
+  filter(species == "SEAT")
+df_obs_plot <- df_all_spp %>%
+  filter(species == "SEAT")
+
+#hist(df_obs_plot$length, freq = F, nclass = 200)
+#hist(df_lw2$length, freq = F, nclass = 200, add = TRUE, col = 'red')
+
+
+plot(density(df_lw_plot$length), lwd =2, main = "", xlab = "Length (mm)", col = 'red')
+lines(density(df_obs_plot$length), lwd =3, lty = 2, col = 'grey')
+```
+
+
+
+
+
+
+

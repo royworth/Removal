@@ -1,0 +1,353 @@
+---
+title: "Removal data analysis: Bohlin and Sundstrom (1977)"
+author: "Roy Martin"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 5
+    number_sections: true
+    keep_html: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, echo = FALSE, warning=FALSE, message=FALSE}
+library(readxl)
+library(ggpubr)
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library(bayesplot)
+library(tidybayes)
+library(rstan)
+
+options(mc.cores = parallel::detectCores(logical = FALSE))
+options( max.print = 1000 )
+
+# stat: skew 
+skew <- function(x) {
+  xdev <- x - mean(x)
+  n <- length(x)
+  r <- sum(xdev^3) / sum(xdev^2)^1.5
+  return(r * sqrt(n) * (1 - 1/n)^1.5)
+}
+```
+
+```{r bugs_example, eval=FALSE, include=FALSE}
+# BUGS likelihood from Mantyniemi et al. 2005
+model {
+  for(j in 1:k) {
+    x[j] ~ dbin(q[j], n[j])
+    n[j + 1] = n[j] - x[j]
+    q[j] = mu * (eta / (eta + j - 1))
+    }
+  n[1] <- exp(u)
+  u ~ dunif(0, 10)
+  eta = exp(log.eta)
+  log.eta ~ dunif(0, 10)
+  # log.eta < –10 # needed only when restricting M_u to M_e
+  mu ~ dbeta(1.1, 1.1)
+  }
+```
+
+
+# Import data
+```{r import_data}
+path <- "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/Bohlin_Sundstrom_1977_Removal.csv"
+
+df_import <- path %>%
+  read.csv() %>%
+  as_tibble()
+
+df_import %>% print()
+
+# create a removal data frame with nrows = n individuals and data for:
+# site number
+# removal session r in 1:R removals
+df_removal <- df_import %>%
+  #select(Site.number, r1, r2, r3, r4, r5, r6, r7, r8) %>% # only first three removals
+  pivot_longer(cols = c(r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20), names_to = "Pass") %>%
+  mutate(site = Site.number, 
+         pass = as.factor(Pass)) %>%
+  select(site, pass, value) %>%
+  uncount(value)
+
+df_removal <- df_removal %>%
+  mutate(day = c(rep(1, 62+26+17+8), #site 1
+                 rep(2, 9+6+4+1),
+                 rep(3, 2+1+1+1),
+                 rep(4, 1+1+0+1),
+                 rep(5, 0+0+1+0),
+                 rep(1, 57+28+22), # site 2
+                 rep(2, 8+3+10+2),
+                 rep(3, 3+5+2+0),
+                 rep(4, 1+2+0+2),
+                 rep(5, 1+0+0+0+0),
+                 rep(1, 66+25+13+12), # site 3
+                 rep(2, 9+5+4+3),
+                 rep(3, 2+2+2+1),
+                 rep(4, 1+0+1+0),
+                 rep(5, 1+0+0+0))) %>%
+  mutate(day = as.integer(day)) %>%
+  mutate(pass = as.integer(gsub(pass, pattern = "r", replacement = ''))) %>%
+  mutate(individual = row_number(),
+         cap = 1) %>%
+  select(individual, site, day, pass, cap)
+  
+df_removal %>% print()
+#save(df_cleaned, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/ICPMS_methods/ICPMS_7d_Expt/model_files/df_cleaned.rda")
+```
+
+
+# Single species model
+```{stan mocc_model_1, eval=FALSE, include=TRUE, output.var='mod1'}
+data {
+  int<lower = 1> nind; // number of individuals captured (across all site)
+  int<lower = 1> nrem; // number of removals
+  int<lower = 1> nsite; // number of sites
+  int<lower = 1> nday; // number of days
+  int<lower = 1> nsite_day; // number of site-in-days (interaction)
+  int<lower = 1> site [nind]; // indicator for s in s=1,..., S sites
+  int<lower = 1> day[nind]; // indicator for day
+  int<lower = 1> site_day[nind]; // indicator for site-in-day interaction
+  //array [nind] real L; // covariate measurement
+  array[nind, nrem] int <lower = 0, upper = 1>  y; // removal capture history
+}
+
+parameters {
+  real b0; // logit-scale intercept on p
+  //array [nsite] real b0; // intercept (by site) for probability of capture
+  real <lower = 0> scale_gamma_s; // scale of site to site variation in p
+  real <lower = 0> scale_gamma_d; // scale of day to day variation in p
+  real <lower = 0> scale_gamma_sd; // scale of site-in-day to site-in-day variation in p
+  vector [nsite] gamma_s_std; // non-centered site effects
+  vector [nday] gamma_d_std; // non-centered day effects
+  vector [nsite_day] gamma_sd_std; // non-centered site-in-day effects
+}
+
+transformed parameters {
+  vector [nind] log_lik;
+  real<lower = 0, upper = 1> p[nind];
+  vector [nsite] gamma_s;
+  vector [nday] gamma_d;
+  vector [nsite_day] gamma_sd;
+  vector[nind] pi0;
+  vector[nind] pcap;
+  vector[nrem] pie[nind];
+  simplex[nrem] muc[nind];
+  
+  // ranefs for p
+  gamma_s = gamma_s_std * scale_gamma_s;
+  gamma_d = gamma_d_std * scale_gamma_d;
+  gamma_sd = gamma_sd_std * scale_gamma_sd;
+  
+  for(i in 1:nind) {
+    //p[i] = inv_logit(b0 + b1 * L[i] + gamma[site[i]]); // probability of capture
+    //p[i] = inv_logit(b0[site[i]] + b1[site[i]] * L[i]); // probability of capture
+    p[i] = inv_logit(b0 + gamma_s[site[i]] + gamma_d[day[i]] + gamma_sd[site_day[i]]); // probability of capture
+    pi0[i] = (1 - p[i]) ^ nrem; // prob not captured across all removals
+    pcap[i] = 1 - pi0[i]; // prob captured across all removals
+    
+    for(j in 1:nrem) {
+      pie[i, j] = p[i] * (1 - p[i]) ^ (j - 1); // probability of removal on pass j
+      muc[i, j] = pie[i, j] / pcap[i]; // multinomial probs for y|ncap
+      }
+    
+    log_lik[i] = multinomial_lpmf(y[i, ] | muc[i, ]);
+    }
+}
+
+model {
+  // priors
+  target += normal_lpdf(b0 | 0, 1.5);
+  //target += normal_lpdf(b1 | 0, 1);
+  target += normal_lpdf(scale_gamma_s | 0, 2);
+  target += normal_lpdf(scale_gamma_d | 0, 2);
+  target += normal_lpdf(scale_gamma_sd | 0, 2);
+  target += normal_lpdf(gamma_s_std | 0, 1);
+  target += normal_lpdf(gamma_d_std | 0, 1);
+  target += normal_lpdf(gamma_sd_std | 0, 1);
+  
+  // sum log-likelihood
+  target += sum(log_lik);
+}
+
+generated quantities {
+  array[nind, nrem] int <lower = 0, upper = 1>  y_rep; // removal capture history
+  int <lower = 0> N_nb[nind]; // neg binom estimate of N conditional on p for each individual caught
+  real N_ht[nind]; // Horvitz-Thompson estimate per individual (N_i = 1 / pcap_i)
+  int <lower = 0> N_total_nb;
+  real N_tot_ht;
+  
+  for(i in 1:nind){
+    y_rep[i, ] = multinomial_rng(muc[i, ], 1);
+    N_ht[i] = 1 / pcap[i];
+    N_nb[i] = 1 + neg_binomial_rng(1 - pcap[i], pcap[i]); // rnbinom(1, 1 * (1 - pcap), pcap)
+    }
+  N_total_nb = sum(N_nb);
+  N_tot_ht = sum(N_ht);
+}
+```
+
+### Make a data list
+For single species
+```{r data_list}
+ch <- df_removal %>% spread(pass, cap, fill = 0) %>%
+  mutate(`18` = 0,
+         `20` = 0) %>%
+  relocate(`18`, .after = `17`)
+
+
+data1 <- list(y = ch[, -1:-3],
+              #L = rnorm(nrow(y), 0, 1),
+              nind = dim(ch)[[1]],
+              site = ch$site, 
+              nsite = max(ch$site),
+              day = ch$day,
+              nday = max(ch$day),
+              site_day = as.numeric(interaction(ch[,2:3])),
+              nsite_day = max(as.numeric(interaction(ch[,2:3]))),
+              #pass = model.matrix(~ df_removal$Pass),
+              nrem = dim(ch[,-1:-3])[[2]]
+              )
+```
+
+### Fit
+Fit the model via $rstan$ interface to $Stan$
+```{r fit_mod1, eval=FALSE, include=TRUE}
+
+fit1 <- sampling(
+  object = mod1,
+  data = data1,
+  chains = 4,
+  iter = 1000,
+  cores = 4,
+  thin = 1,
+  init = 0,
+  seed = 123#,
+  #control = list(adapt_delta = 0.90, max_treedepth = 12)
+  )
+
+#save(fit1, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/eDNA_RARE/model_files/fit1.rda")
+```
+
+### Parameters summary
+Tabular summary of parameters in the linear predictors.
+```{r print_mod1, echo=TRUE}
+#load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/eDNA_RARE/model_files/fit1.rda")
+
+print(fit1, pars = c("b0", "scale_gamma_s", "scale_gamma_d", "scale_gamma_sd", "N_total_nb", "N_tot_ht", "lp__"), digits_summary = 2)
+```
+
+Extract the draws
+```{r extract_mod1, echo=TRUE}
+#load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/eDNA_RARE/model_files/fit1.rda")
+
+draws1 <- extract(fit1)
+```
+
+
+Plot and tables summarizing N and p by site
+```{r p_plots_mod1, fig.align="center", fig.asp=0.5, fig.width=8}
+# Plot p by site
+par(mfrow = c(1, 3))
+for(s in 1:max(data1$site)){
+  hist(plogis(draws1$b0[, s]), 
+       freq = F,
+       nclass = 40, 
+       xlim = c(0, 1),
+       main = paste0("Site ", s),
+       ylab = "Density",
+       xlab = expression(hat(p)))
+  #abline(v = plogis(mean(draws1$b0)), col = 'red', lwd = 3)
+}
+```
+
+```{r p_table_mod1, fig.align="center", fig.asp=0.5, fig.width=6}
+# Summarise p by site
+p_table <- matrix(NA, nrow = max(data1$site), ncol = 4)
+
+for(s in 1:max(data1$site)){
+  p_table[s, 1] <- round(mean(plogis(draws1$b0[, s])), 2) # means
+  p_table[s, 2:4] <- round(quantile(plogis(draws1$b0[, s]), probs = c(0.025, 0.5, 0.975)), 2)
+}
+
+p_table <- p_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site = seq(1, 3, 1)) %>%
+  select(site, mean, median, L95, U95)
+
+p_table %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of p by site")
+```
+
+
+```{r N_plots_mod1, fig.align="center", fig.asp=0.33, fig.width=8}
+# Plot N by site
+par(mfrow = c(1, 3))
+
+for(s in 1:max(data1$site)){
+  hist(rowSums(draws1$N_nb[, data1$site == s]), 
+       nclass = max(rowSums(draws1$N_nb[, data1$site == s]))/2, 
+       freq = F,
+       #xlim = c(sum(data1$site == s) - 5, round(sum(data1$site == s) / plogis(mean(draws1$b0 + draws1$gamma[, s])), 0)),
+       main = paste0("Site ", s),
+       ylab = "Density",
+       xlab = expression(hat(N)))
+  abline(v = rowSums(df_import[,2:21], na.rm = TRUE)[s], col = 'blue', lwd = 3)
+}
+```
+
+# Negative binomial N
+```{r N_table_mod1, fig.align="center", fig.asp=0.5, fig.width=6}
+# Summarise p by site
+N_table <- matrix(NA, nrow = max(data1$site), ncol = 4)
+
+for(s in 1:(max(data1$site))){
+  N_table[s, 1] <- round(mean(rowSums(draws1$N_nb[, data1$site == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws1$N_nb[, data1$site == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site = seq(1, 3, 1),
+         X8 = rowSums(df_import[, 2:9]), # number removed in passes 1-3
+         X20 = rowSums(df_import[,2:21], na.rm = TRUE)) %>% # number removed in all passes (1 - 20)
+  select(site, X8, X20, mean, median, L95, U95)
+
+N_table %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+```
+
+
+# Horvitz-Thompson N
+```{r N_Horwitz_Thompson_table_mod1, fig.align="center", fig.asp=0.5, fig.width=6}
+# Summarise p by site
+N_table <- matrix(NA, nrow = max(data1$site), ncol = 4)
+
+for(s in 1:(max(data1$site))){
+  N_table[s, 1] <- round(mean(rowSums(draws1$N_h[, data1$site == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws1$N_h[, data1$site == s]), probs = c(0.025, 0.5, 0.975)), 0)
+}
+
+N_table <- N_table %>%
+  `colnames<-` (c("mean", "L95", "median", "U95")) %>%
+  as_tibble() %>%
+  mutate(site = seq(1, 3, 1),
+         X8 = rowSums(df_import[, 2:9]), # number removed in passes 1-3
+         X20 = rowSums(df_import[,2:21], na.rm = TRUE)) %>% # number removed in all passes (1 - 20)
+  select(site, X8, X20, mean, median, L95, U95)
+
+N_table %>%
+  ggpubr::ggtexttable(rows = NULL) %>%
+  tab_add_title(text = "Summary of N by site") # "X5" is the total number caught in all removal passes (including passes 4-5)
+```
