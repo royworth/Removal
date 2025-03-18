@@ -3,6 +3,7 @@ This repository contains code for simulations, model fitting, and model results 
 
 
 Bohlin, T. and B. Sundstrom. 1977. Influence of Unequal Catchability on Population Estimates Using the Lincoln Index and the Removal Method Applied to Electro-Fishing. _Oikos_ 28(1): 123-129.
+
 Dorazio, R.M., H.L. Jelks, and F. Jordan. 2005. Improving Removal-Based Estimates of Abundance by Sampling a Population of Spatially Distinct Subpopulations. Biometrics 61: 1093-1101. 
 
 # Disclaimer
