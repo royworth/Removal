@@ -1,5 +1,5 @@
 # Description
-This repository contains code for simulations, model fitting, and model results related to Bayesian models for population estimates derived from removal sampling. The data folder contains removal data from published literature for trout (Bohlin and Sundstrom 1977) and Okaloosa darter (Dorazio 2005). 
+This repository contains code for simulations, model fitting, and model results related to Bayesian models for population estimates derived from removal sampling and conditional on individual capture histories and individual-level covariates. The data folder contains removal data from published literature for trout (Bohlin and Sundstrom 1977) and Okaloosa darter (Dorazio 2005). 
 
 
 Bohlin, T. and B. Sundstrom. 1977. Influence of Unequal Catchability on Population Estimates Using the Lincoln Index and the Removal Method Applied to Electro-Fishing. _Oikos_ 28(1): 123-129.
