@@ -856,6 +856,7 @@ data3 <- list(y = ch[, -1],
 ### Fit 3
 Fit the model via $rstan$ interface to $Stan$
 ```{r fit_mod1, eval=FALSE, include=TRUE}
+# takes about
 fit3 <- sampling(
   object = mod3,
   data = data3,
@@ -864,17 +865,17 @@ fit3 <- sampling(
   iter = 2000,
   cores = 4,
   thin = 1,
-  seed = 100#,
+  seed = 123#,
   #control = list(adapt_delta = 0.95, max_treedepth = 14)
   )
 
-#save(fit3, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit2.rda")
+save(fit3, file = "./../modelFiles/fit3.rda")
 ```
 
 ### Parameters summary
 Tabular summary of parameters in the linear predictors.
 ```{r load_mod2, eval=TRUE, include=FALSE}
-load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/fit3.rda")
+load("./../modelFiles/fit3.rda")
 ```
 
 ```{r print_mod2}
@@ -885,17 +886,16 @@ Extract the draws
 ```{r extract_mod2, eval=FALSE, include=TRUE}
 draws3 <- extract(fit3)
 
-save(draws3, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
+#save(draws3, file = "C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
 ```
 
 ```{r load_draws, eval=FALSE, include=FALSE}
-load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
+#load("C:/Users/rmartin/OneDrive - Environmental Protection Agency (EPA)/Documents/CSS_Data/draws3.rda")
 ```
 
 
 
 ### Plots and tables
-
 ```{r pick_a_species}
 # pick a species by index
 k <- 3
@@ -1059,15 +1059,15 @@ for(s in 1:max(data3$site)){
 ```{r N_plots_mod2, fig.align="center", fig.asp=1, fig.width=8}
 par(mfrow = c(4, 3))
 
-for(s in sort(unique(data2$species))){
-  hist(rowSums(draws2$N_i[, data2$species == s]), 
-       nclass = max(rowSums(draws2$N_i[, data2$species == s]))/2, 
+for(s in sort(unique(data3$species))){
+  hist(rowSums(draws3$N_i[, data3$species == s]), 
+       nclass = max(rowSums(draws3$N_i[, data3$species == s]))/2, 
        freq = F,
-       xlim = c(sum(data2$species == s), round(sum(data2$species == s) / plogis(mean(draws2$b0 + draws2$gamma_sp[, s])), 0) * 1.5),
+       xlim = c(sum(data3$species == s), round(sum(data3$species == s) / plogis(mean(draws3$b0 + draws3$gamma_sp[,1 , s])), 0) * 1.5),
        main = paste0("Species ", s, ": ", unique(df_all_spp[which(df_all_spp$species_index == s),]$species)),
        ylab = "Density",
        xlab = expression(hat(N)))
-  abline(v = sum(data2$species == s), col = 'red', lwd = 3)
+  abline(v = sum(data3$species == s), col = 'red', lwd = 3)
 }
 ```
 
@@ -1102,19 +1102,19 @@ N_table %>%
 ##### Species
 ```{r N_table_mod1, fig.align="center", fig.asp=1.1, fig.width=6}
 # Summarise N by site
-N_table <- matrix(NA, nrow = data2$nspecies, ncol = 4)
+N_table <- matrix(NA, nrow = data3$nspecies, ncol = 4)
 
-for(s in sort(unique(data2$species))){
-  N_table[s, 1] <- round(mean(rowSums(draws2$N_i[, data2$species == s])), 1) # means
-  N_table[s, 2:4 ] <- round(quantile(rowSums(draws2$N_i[, data2$species == s]), probs = c(0.025, 0.5, 0.975)), 0)
+for(s in sort(unique(data3$species))){
+  N_table[s, 1] <- round(mean(rowSums(draws3$N_i[, data3$species == s])), 1) # means
+  N_table[s, 2:4 ] <- round(quantile(rowSums(draws3$N_i[, data3$species == s]), probs = c(0.025, 0.5, 0.975)), 0)
 }
 
 N_table <- N_table %>%
   `colnames<-` (c("mean", "L95", "median", "U95")) %>%
   as_tibble() %>%
-  mutate(species_index = seq(1, max(data2$species), 1),
+  mutate(species_index = seq(1, max(data3$species), 1),
          species_name = df_all_spp %>% select(species_index, species) %>% unique() %>% arrange(species_index) %>% pull(species),
-         X3 = as.vector(summary(factor(data2$species)))) %>% # number removed in passes 1-3
+         X3 = as.vector(summary(factor(data3$species)))) %>% # number removed in passes 1-3
   select(species_index, species_name, X3, mean, median, L95, U95)
 
 N_table %>%
@@ -1148,9 +1148,9 @@ Filter on e.g., species, site and plot
 #         site == "Bear Run")
 
 df_lw_plot <- df_lw %>%
-  filter(species == "SEAT")
+  filter(species == "AMRU")
 df_obs_plot <- df_all_spp %>%
-  filter(species == "SEAT")
+  filter(species == "AMRU")
 
 #hist(df_obs_plot$length, freq = F, nclass = 200)
 #hist(df_lw2$length, freq = F, nclass = 200, add = TRUE, col = 'red')
